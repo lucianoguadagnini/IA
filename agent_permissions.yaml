@@ -1,0 +1,122 @@
+# Module 8 Practice - Exercise 2d, Identity.
+# One workload identity per agent. Every permission names the mechanism that
+# enforces it inside Meridian's existing environment (Entra ID, ServiceNow,
+# Microsoft Graph, Azure Key Vault, Azure Firewall, Exchange Online, Sentinel).
+# The security team reviews this file before any code is written and may
+# strike any line. No new platform licences are assumed.
+
+common:
+  identity_provider: Entra ID
+  per_agent:
+    - one app registration and service principal per agent (no shared identities)
+    - user-assigned managed identity for Azure-hosted compute
+    - secrets and ServiceNow OAuth client credentials in Azure Key Vault,
+      RBAC-scoped to that agent's managed identity only, 90-day rotation
+    - Conditional Access for workload identities: allowed only from the
+      tenancy's own Azure region and compute (data residency)
+  servicenow:
+    - dedicated integration user per agent, custom role per agent
+    - ACLs restrict tables, fields and record states, not just tables
+    - audit log on the credentialing table forwarded to Sentinel
+  logging:
+    - every run writes a run_id to a ServiceNow work note on the record
+    - Application Insights trace keyed by run_id: identity, input hash,
+      model deployment and version, output
+    - Entra sign-in logs and ServiceNow audit forwarded to Log Analytics / Sentinel
+  memory:
+    - no agent keeps state across files; all state lives on the ServiceNow record
+  model_access:
+    - Azure OpenAI deployed in-region, private endpoint, no training on tenant data
+    - fallback if security declines: open-weight model on in-region compute
+
+agents:
+
+  - name: intake-completeness
+    role: Read a new application against the completeness checklist and
+          return a missing-items list to the intake team.
+    reads:
+      - source: servicenow.credentialing
+        scope: records in state 'new' only, plus their application attachments
+        enforced_by: ServiceNow role acl (table read, condition state=new)
+      - source: sharepoint.playbook
+        scope: completeness checklist document only
+        enforced_by: Graph Sites.Selected granted on the playbook site only
+    writes:
+      - target: servicenow.credentialing
+        scope: field completeness_result, one work note
+        enforced_by: ServiceNow field-level acl (write on two fields)
+    cannot:
+      - create or delete records
+      - send email
+      - read any record outside state 'new'
+
+  - name: psv-evidence-collector
+    role: Query licence boards, board certification, sanction and exclusion
+          lists; attach dated, hashed evidence to the record.
+    reads:
+      - source: servicenow.credentialing
+        scope: identity fields and claimed credentials, state 'complete' only
+        enforced_by: ServiceNow role acl (field list + condition state=complete)
+      - source: primary_sources.external
+        scope: explicit FQDN allowlist maintained by security
+        enforced_by: Azure Firewall application rules / NSG egress; anything
+                     not on the list is dropped
+    writes:
+      - target: servicenow.credentialing
+        scope: evidence attachments (immutable: source url, timestamp, sha256),
+               state transition complete -> evidence_collected
+        enforced_by: ServiceNow acl; attachments write-once via business rule
+    cannot:
+      - set state 'verified' (human verifier role only, enforced by acl)
+      - access Oracle or the mainframe
+      - reach any domain not on the allowlist
+
+  - name: reference-outreach
+    role: Send reference requests from one shared mailbox, track responses
+          and follow-ups, flag non-response for human escalation.
+    reads:
+      - source: servicenow.credentialing
+        scope: reference contact fields on the record
+        enforced_by: ServiceNow role acl on the reference sub-table
+    writes:
+      - target: servicenow.credentialing
+        scope: outreach state, follow-up timestamps, responses as attachments
+        enforced_by: ServiceNow acl on the reference sub-table
+      - target: exchange_online
+        scope: Mail.Send from mailbox credentialing-references@ only
+        enforced_by: Exchange application access policy binding the app id to
+                     that one mailbox; Purview DLP blocks provider PII outbound
+    cannot:
+      - email any address not on the record
+      - substitute a reference (human decision)
+      - close the reference step
+
+  - name: packet-assembler
+    role: Render the committee packet from the record; label generated
+          narrative as generated.
+    reads:
+      - source: servicenow.credentialing
+        scope: full record, state 'references_complete' only
+        enforced_by: ServiceNow acl with state condition
+    writes:
+      - target: sharepoint.committee_packets
+        scope: one document library
+        enforced_by: Graph Sites.Selected, write on that library only
+      - target: servicenow.credentialing
+        scope: state transition references_complete -> packet_ready
+        enforced_by: ServiceNow acl
+    cannot:
+      - modify evidence attachments
+      - set any approval state
+
+blast_radius_review:
+  worst_case_agent: psv-evidence-collector
+  if_compromised:
+    - can read identity fields for the tens of files currently in state 'complete'
+    - can write junk attachments a human verifier sees before any decision
+    - cannot reach Oracle, send mail, change a verification result, or reach
+      any domain off the allowlist
+  detection: Sentinel analytics on the agent's sign-ins and firewall denies
+  audit_six_months_later:
+    - pick any file -> work note run_id -> App Insights trace -> Entra sign-in
+      -> hashed evidence; no human needs to be asked
